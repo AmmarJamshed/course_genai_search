@@ -19,7 +19,7 @@ import streamlit as st
 # Page config & styling
 # -------------------------------
 st.set_page_config(
-    page_title="Course & Training Meta-Search",
+    page_title="Coursemon Meta-Search",
     page_icon="🎓",
     layout="wide",
 )
