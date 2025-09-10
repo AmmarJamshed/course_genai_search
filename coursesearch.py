@@ -203,7 +203,7 @@ def make_query_variants(pi: ParsedIntent, raw_text: str) -> List[str]:
 # -------------------------------
 # UI
 # -------------------------------
-st.markdown('<div class="app-title">🎓 Course & Training Meta-Search (No OpenAI)</div>', unsafe_allow_html=True)
+st.markdown('<div class="app-title">🎓 Coursemon Meta-Search</div>', unsafe_allow_html=True)
 st.markdown('<div class="app-sub">Type anything (e.g., “Hands-on weekend bootcamp on Python for finance with real datasets and a certificate”).</div>', unsafe_allow_html=True)
 
 with st.sidebar:
