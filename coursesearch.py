@@ -1,12 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
-
-
 # app.py
 # GenAI-free meta search for courses & trainings (Coursera, Udemy, Simpliv, Educative)
-# No external AI libs needed. Uses a lightweight keyword extractor and builds deep links.
+# Renders ranked-looking cards (clickable title + badges + overview) per platform.
 
 import re
 import urllib.parse
@@ -34,7 +31,7 @@ def inject_style():
             border: 1px solid rgba(0,0,0,0.08);
             border-radius: 14px;
             padding: 16px;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
             background: white;
             box-shadow: 0 3px 10px rgba(0,0,0,0.04);
         }
@@ -49,6 +46,12 @@ def inject_style():
             background: #f8fafc;
         }
         .dim { opacity: 0.7; }
+        a.card-title {
+            text-decoration: none;
+        }
+        a.card-title:hover {
+            text-decoration: underline;
+        }
         </style>
         """,
         unsafe_allow_html=True
@@ -81,7 +84,7 @@ weekend weekday evening morning hands-on hands free cheap certificate
 """.split())
 
 LEVEL_WORDS = {
-    "beginner": {"beginner", "intro", "introduction", "foundations", "starter", "basic"},
+    "beginner": {"beginner", "intro", "introduction", "foundations", "starter", "basic", "no prior"},
     "intermediate": {"intermediate", "mid", "some experience"},
     "advanced": {"advanced", "expert", "pro", "senior", "specialist"}
 }
@@ -113,7 +116,7 @@ def extract_keywords(text: str, top_k: int = 8) -> List[str]:
     tokens = re.findall(r"[A-Za-z0-9\-\+/#]+", text.lower())
     picked, seen = [], set()
     for t in tokens:
-        if t in STOPWORDS: 
+        if t in STOPWORDS:
             continue
         if t.isdigit():
             continue
@@ -201,6 +204,51 @@ def make_query_variants(pi: ParsedIntent, raw_text: str) -> List[str]:
     return out[:4]
 
 # -------------------------------
+# Small UI helpers
+# -------------------------------
+def badge(text: str) -> str:
+    return f'<span class="pill">{text}</span>'
+
+def render_course_card(platform: str, query_variant: str, extras: Dict[str, str], modality: Optional[str]):
+    """Renders a single clickable 'card' for a platform + query variant."""
+    url = search_url(platform, query_variant)
+
+    # badges row (metadata preview, not scraped)
+    chips = []
+    if modality and modality != "any":
+        chips.append(badge(modality.replace("_", " ").title()))
+    level = extras.get("level")
+    if level:
+        chips.append(badge(level.title()))
+    if extras.get("certificate") == "required":
+        chips.append(badge("Certificate"))
+    if extras.get("duration") == "short":
+        chips.append(badge("Short / Crash"))
+    if extras.get("price") == "free_preferred":
+        chips.append(badge("Prefer Free"))
+
+    st.markdown(
+        f'''
+        <div class="platform-card">
+          <h4 style="margin: 0 0 8px 0;">
+            <a class="card-title" href="{url}" target="_blank">{platform}: {query_variant.title()}</a>
+          </h4>
+          <div>{" ".join(chips)}</div>
+        ''',
+        unsafe_allow_html=True
+    )
+
+    with st.expander("Overview"):
+        st.write(
+            f"This opens **{platform}** results for: **{query_variant}**.\n\n"
+            "• Use platform-side filters (price, duration, language, ratings) for precise picks.\n"
+            "• Your selected filters here are previewed as badges above.\n"
+            "• To show real course titles, ratings, and durations here, connect a scraper/API later."
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# -------------------------------
 # UI
 # -------------------------------
 st.markdown('<div class="app-title">🎓 Coursemon Meta-Search</div>', unsafe_allow_html=True)
@@ -255,6 +303,7 @@ if go and user_text.strip():
 
     modality = parsed.modality or mode_to_modality.get(training_mode, "any")
 
+    # Search summary chips
     chips = []
     if parsed.topic:
         chips.append(("Topic", parsed.topic))
@@ -274,12 +323,11 @@ if go and user_text.strip():
     else:
         st.markdown('<span class="pill">Free-form search</span>', unsafe_allow_html=True)
 
-    # Add level/modality hints to keywords
+    # Add level/modality hints to keywords to nudge platform searches
     kw = parsed.keywords[:]
     if "level" in extras and extras["level"] not in kw:
         kw.append(extras["level"])
     if modality and modality != "any":
-        # modality hint words to try nudging platform search
         if modality == "online_training":
             kw.extend(["live", "instructor-led", "workshop"])
         elif modality == "online_course":
@@ -297,6 +345,7 @@ if go and user_text.strip():
         keywords=kw
     ), user_text)
 
+    # Effective platforms by mode
     effective_platforms = platforms.copy()
     if training_mode == "Online Trainings (Simpliv)":
         effective_platforms = [p for p in platforms if p == "Simpliv"]
@@ -304,21 +353,19 @@ if go and user_text.strip():
         st.warning("Onsite trainings directory is coming soon. Showing online alternatives for now.")
         effective_platforms = [p for p in platforms if p in ["Coursera","Udemy","Simpliv","Educative"]]
 
-    st.markdown("### Recommendations & Deep Links")
-    st.caption("Click to open results on each platform. Use platform filters for price, duration, language, etc.")
+    # ---------------------------
+    # Cards instead of just links
+    # ---------------------------
+    st.markdown("### Recommendations & Course Lists")
+    st.caption("Click a title to open the provider. Expand for an overview. (Real course details can be added when scrapers/APIs are connected.)")
 
-    col1, col2 = st.columns([1,1])
+    # Render: group by query variant, then per-platform cards
     for i, qv in enumerate(variants, start=1):
-        with (col1 if i % 2 else col2):
-            st.markdown(
-                f'<div class="platform-card"><div class="dim">Query variant {i}</div><h4>{qv}</h4>',
-                unsafe_allow_html=True
-            )
-            links = []
-            for pf in effective_platforms:
-                links.append(f"- [{pf}]({search_url(pf, qv)})")
-            st.markdown("\n".join(links))
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(f"#### 🔎 Query variant {i}: *{qv}*")
+        cols = st.columns(2)
+        for idx, pf in enumerate(effective_platforms):
+            with cols[idx % 2]:
+                render_course_card(pf, qv, extras, modality)
 
     st.markdown("---")
     st.markdown("#### Tips")
@@ -326,12 +373,11 @@ if go and user_text.strip():
         """
 - Add specific **tools** (e.g., “YOLOv8, PyTorch, OpenCV”) or **domain** (“for agriculture”) to sharpen results.
 - Switch **Mode** to focus on Simpliv live trainings or keep it mixed for broader discovery.
-- Use platform filters to refine by **price**, **duration**, **language**, **ratings**, etc.
+- Use platform filters on the provider page for **price**, **duration**, **language**, **ratings**, etc.
         """
     )
 elif go:
     st.warning("Please type what you’re looking for (one sentence is fine).")
 
 st.markdown("---")
-st.caption("No external AI used. This app generates clean search links based on your text.")
-
+st.caption("No external AI used. This app generates clean platform searches and renders friendly cards with your chosen filters.")
