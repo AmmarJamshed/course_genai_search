@@ -1,26 +1,11 @@
 # app.py
-# Coursemon — GENAI-style Search (No APIs, One-Box UI)
-# ----------------------------------------------------
-# • Single search bar, clean results list (title, snippet, URL)
-# • No external LLMs/APIs: rule-based "GENAI" query rewrite
-# • Expands user prompt into several smart queries:
-#     - baseline
-#     - skills synonyms + learning-intent terms (course|training|bootcamp|class|certificate)
-#     - site-pack targeting edu/training domains (site:coursera.org OR …)
-#     - location/price/mode/duration hints normalized
-#     - phrase + intitle boosters
-# • Searches Bing + DuckDuckGo + Yahoo (public HTML) → merge → dedupe → rerank
-#
-# Run:
-#   pip install -r requirements.txt
-#   streamlit run app.py
-#
-# Notes:
-# - HTML selectors may change; this is best-effort scraping.
-# - For production, move to a crawler index + partner feeds/APIs.
+# Coursemon — GENAI Search (No API, One-Box)
+# -------------------------------------------
+# One search bar. Results list. No API keys.
+# Engines: Bing, DuckDuckGo, Yahoo (public HTML scrape).
+# Smart query rewrite focuses on courses/trainings anywhere on the web.
 
-import re
-import html
+import re, html
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -31,16 +16,11 @@ from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-
 APP_NAME = "Coursemon — GENAI Search (No API)"
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-# -------------------- helpers --------------------
-
+# -------------------- HTTP session --------------------
 def sess() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
@@ -51,20 +31,15 @@ def clean(x: Optional[str]) -> str:
     return re.sub(r"\s+", " ", html.unescape(x)).strip()
 
 def dedupe(results: List[Dict]) -> List[Dict]:
-    seen = set()
-    out = []
+    seen, out = set(), []
     for r in results:
         u = (r.get("url") or "").split("#")[0]
-        if not u or u in seen: 
-            continue
-        seen.add(u)
-        out.append(r)
+        if not u or u in seen: continue
+        seen.add(u); out.append(r)
     return out
 
-# -------------------- engines (HTML) --------------------
-
+# -------------------- Engines (HTML scrape) --------------------
 def search_bing(q: str, num: int, s: requests.Session) -> List[Dict]:
-    """Scrape Bing HTML."""
     try:
         url = "https://www.bing.com/search?" + urlencode({"q": q, "count": min(num, 20)})
         r = s.get(url, timeout=10)
@@ -73,10 +48,8 @@ def search_bing(q: str, num: int, s: requests.Session) -> List[Dict]:
         out = []
         for li in soup.select("li.b_algo"):
             a = li.select_one("h2 a")
-            if not a or not a.get("href"): 
-                continue
-            title = clean(a.get_text())
-            link = a["href"]
+            if not a or not a.get("href"): continue
+            title = clean(a.get_text()); link = a["href"]
             sn = li.select_one("p, div.b_caption p")
             snippet = clean(sn.get_text() if sn else "")
             out.append({"title": title, "snippet": snippet, "url": link, "engine": "bing"})
@@ -86,7 +59,6 @@ def search_bing(q: str, num: int, s: requests.Session) -> List[Dict]:
         return []
 
 def search_ddg(q: str, num: int, s: requests.Session) -> List[Dict]:
-    """Scrape DuckDuckGo HTML."""
     try:
         r = s.get("https://html.duckduckgo.com/html/", params={"q": q}, timeout=10)
         if not r.ok: return []
@@ -101,7 +73,6 @@ def search_ddg(q: str, num: int, s: requests.Session) -> List[Dict]:
             snippet = clean(sn.get_text() if sn else "")
             out.append({"title": title, "snippet": snippet, "url": a["href"], "engine": "ddg"})
             if len(out) >= num: break
-        # fallback selector sweep
         if not out:
             for a in soup.select("a.result__a, a.result__url"):
                 href = a.get("href")
@@ -113,7 +84,6 @@ def search_ddg(q: str, num: int, s: requests.Session) -> List[Dict]:
         return []
 
 def search_yahoo(q: str, num: int, s: requests.Session) -> List[Dict]:
-    """Scrape Yahoo HTML."""
     try:
         url = "https://search.yahoo.com/search?" + urlencode({"p": q})
         r = s.get(url, timeout=10)
@@ -122,8 +92,7 @@ def search_yahoo(q: str, num: int, s: requests.Session) -> List[Dict]:
         out = []
         for d in soup.select("div#web h3.title a, div.dd.algo.algo-sr h3 a"):
             href = d.get("href")
-            if not href or not href.startswith("http"):
-                continue
+            if not href or not href.startswith("http"): continue
             title = clean(d.get_text())
             cont = d.find_parent("div", class_=re.compile("algo"))
             sn = cont.select_one("div.compText, p") if cont else None
@@ -134,26 +103,50 @@ def search_yahoo(q: str, num: int, s: requests.Session) -> List[Dict]:
     except Exception:
         return []
 
-# -------------------- "GENAI" query rewrite (rule-based) --------------------
+# -------------------- GENAI-style rewrite (rule-based) --------------------
 
-SITE_PACK = [
-    "site:coursera.org", "site:edx.org", "site:udacity.com", "site:udemy.com",
-    "site:classcentral.com", "site:datacamp.com", "site:generalassemb.ly",
-    "site:simplilearn.com", "site:brainstation.io", "site:lewagon.com",
-    "site:linkedin.com/learning", "site:futurelearn.com",
-    "site:.edu", "site:.ac.uk", "site:.edu.pk", "site:.ac.pk"
+# Learning signals we want in searches
+LEARNING = [
+    "course","training","bootcamp","certificate","diploma","short course",
+    "MOOC","program","class","workshop","seminar","lecture",
+    "curriculum","syllabus","catalog"
 ]
 
-SKILL_SYNONYMS = {
-    "data science": ["data science", "data analytics", "machine learning", "ai", "ml", "python data"],
-    "python": ["python", "pandas", "numpy", "data wrangling"],
-    "cybersecurity": ["cybersecurity", "information security", "soc", "siem"],
-    "mba": ["mba", "business administration", "management", "executive mba"],
+# Subject synonyms — broad coverage incl. humanities
+SUBJECT_SYNONYMS = {
+    "history": ["history","world history","ancient history","modern history","historical studies"],
+    "philosophy": ["philosophy","ethics","logic","metaphysics","epistemology","philosophy of mind","aesthetics"],
+    "humanities": ["humanities","liberal arts","classics","religious studies","anthropology","sociology","political philosophy"],
+    "data science": ["data science","machine learning","ml","ai","data analytics","python data","statistics"],
+    "python": ["python","pandas","numpy","data wrangling","programming in python"],
+    "cybersecurity": ["cybersecurity","information security","infosec","soc","siem","network security"],
+    "business": ["business","management","entrepreneurship","marketing","finance","accounting","operations"],
+    "mba": ["mba","business administration","executive mba"],
+    "math": ["mathematics","calculus","linear algebra","discrete math","probability","statistics"],
+    "cs": ["computer science","algorithms","data structures","systems","software engineering"],
+    "design": ["design","graphic design","ui ux","user experience","product design","visual design"],
+    "english": ["english","literature","writing","composition","critical reading"],
+    "economics": ["economics","microeconomics","macroeconomics","econometrics"],
+    "law": ["law","legal studies","jurisprudence","international law","constitutional law"],
 }
 
-LEARNING_INTENT = ["course", "training", "bootcamp", "certificate", "class", "program", "workshop"]
+# Site packs
+MOOC_PACK = [
+    "site:coursera.org","site:edx.org","site:futurelearn.com","site:classcentral.com",
+    "site:udacity.com","site:udemy.com","site:datacamp.com","site:skillshare.com",
+    "site:linkedin.com/learning"
+]
+UNIV_PACK = [
+    "site:.edu","site:.ac.uk","site:.edu.pk","site:.ac.pk","site:.ac.in","site:.edu.au",
+    "site:openlearning.com","site:ocw.mit.edu","site:extension.harvard.edu","site:canvascatalog.com",
+    "catalog","bulletin"
+]
+BOOTCAMP_PACK = [
+    "site:generalassemb.ly","site:brainstation.io","site:lewagon.com","site:simplilearn.com",
+    "site:thinkful.com","site:springboard.com"
+]
 
-LOCATIONS = ["karachi","lahore","islamabad","pakistan","uk","london","usa","new york","germany","berlin","uae","dubai","india","mumbai"]
+LOCATIONS = ["karachi","lahore","islamabad","pakistan","uk","london","usa","new york","germany","berlin","uae","dubai","india","mumbai","canada","toronto","europe","asia"]
 
 def parse_hints(text: str) -> Dict:
     t = text.lower()
@@ -161,86 +154,94 @@ def parse_hints(text: str) -> Dict:
     # location
     for loc in LOCATIONS:
         if re.search(rf"\b{re.escape(loc)}\b", t):
-            hints["loc"] = loc
-            break
-    # budget
-    m = re.search(r"(?:(?:under|below|less than|<=)\s*)?([$€£]|rs\.?|pkr)?\s?(\d{2,6})", t)
-    if m:
-        # keep raw number; engines handle currency words
-        hints["budget"] = m.group(2)
+            hints["loc"] = loc; break
+    # price
+    m = re.search(r"(?:under|below|less than|<=)?\s*(?:rs\.?|pkr|\$|usd|eur|£)?\s*(\d{2,6})", t)
+    if m: hints["budget"] = m.group(1)
     # mode
     if re.search(r"\bonline|remote|live online\b", t): hints["mode"] = "online"
-    elif re.search(r"\bonsite|in[- ]person|campus\b", t): hints["mode"] = "onsite"
+    elif re.search(r"\b(on-?site|in[- ]person|campus)\b", t): hints["mode"] = "onsite"
     # duration
     d = re.search(r"\b(\d+\s*(hours?|days?|weeks?|months?))\b|evening|weekend|short|part[- ]time|full[- ]time", t)
     if d: hints["duration"] = d.group(0)
-    # topic (remove obvious hints)
-    topic = re.sub(r"under|below|less than|<=|\d{2,6}|online|onsite|in[- ]person|evening|weekend|short|part[- ]time|full[- ]time", " ", t)
+    # topic guess: strip common hint words
+    topic = t
+    topic = re.sub(r"(under|below|less than|<=|\d{2,6}|online|on-?site|in[- ]person|evening|weekend|short|part[- ]time|full[- ]time)", " ", topic)
     for loc in LOCATIONS: topic = re.sub(rf"\b{re.escape(loc)}\b", " ", topic)
-    hints["topic"] = clean(topic)
+    topic = clean(topic)
+    hints["topic"] = topic if topic else text.lower()
     return hints
 
-def topic_synonyms(topic: str) -> List[str]:
+def subject_expand(topic: str) -> List[str]:
+    topic = topic.strip()
     out = [topic]
-    for k, vs in SKILL_SYNONYMS.items():
+    for k, vs in SUBJECT_SYNONYMS.items():
         if k in topic:
             out.extend(vs)
+    # If two words joined by "and", split and expand each (e.g., "history and philosophy")
+    if " and " in topic:
+        for part in [p.strip() for p in topic.split(" and ") if p.strip()]:
+            out.append(part)
+            for k, vs in SUBJECT_SYNONYMS.items():
+                if k in part:
+                    out.extend(vs)
     return list(dict.fromkeys(out))
 
 def genai_expand(user_query: str) -> List[str]:
-    """Produce several robust queries from a natural prompt."""
+    """Turn any topic prompt into robust course/training search queries."""
     hints = parse_hints(user_query)
-    topic = hints["topic"] or user_query.lower()
-    syns = topic_synonyms(topic)
-    syn_str = " OR ".join(f"\"{s}\"" for s in syns)
+    syns = subject_expand(hints["topic"])
+    syn_str = " OR ".join(f"\"{s}\"" for s in syns[:6])  # cap to keep short
+    learn = " OR ".join(LEARNING)
 
-    intent_str = " OR ".join(LEARNING_INTENT)
+    site_mooc = " OR ".join(MOOC_PACK)
+    site_univ = " OR ".join(UNIV_PACK)
+    site_boot = " OR ".join(BOOTCAMP_PACK)
 
-    # site pack
-    site_str = " OR ".join(SITE_PACK)
+    # structural operators for course pages
+    structural = "(intitle:course OR inurl:course OR inurl:courses OR inurl:program OR inurl:catalog OR inurl:syllabus)"
 
-    parts = []
-    # baseline
-    parts.append(f"({syn_str}) ({intent_str})")
+    variants = []
 
-    # with location/mode/duration
-    extra = []
-    if hints["loc"]: extra.append(hints["loc"])
-    if hints["mode"]: extra.append(hints["mode"])
-    if hints["duration"]: extra.append(hints["duration"])
-    if hints["budget"]: extra.append(f"under {hints['budget']}")
-    if extra:
-        parts.append(f"({syn_str}) ({intent_str}) " + " ".join(extra))
+    # 1) Baseline: topic + learning signals
+    variants.append(f"({syn_str}) ({learn})")
 
-    # with site pack
-    parts.append(f"({syn_str}) ({intent_str}) ({site_str})")
+    # 2) Structural signals (forces course-like pages)
+    variants.append(f"({syn_str}) {structural}")
 
-    # phrase + intitle boosters
-    key_phrase = " ".join(syns[:1] or [topic]).strip()
-    parts.append(f"\"{key_phrase}\" intitle:({intent_str})")
-    if hints["loc"]:
-        parts.append(f"\"{key_phrase}\" {hints['loc']} intitle:({intent_str})")
+    # 3) MOOC/marketplaces
+    variants.append(f"({syn_str}) ({learn}) ({site_mooc})")
 
-    # price normalized with multiple currencies words
-    if hints["budget"]:
-        parts.append(f"({syn_str}) ({intent_str}) (under {hints['budget']} OR <= {hints['budget']} OR price {hints['budget']} OR PKR {hints['budget']} OR $ {hints['budget']})")
+    # 4) University catalogs / official syllabi
+    variants.append(f"({syn_str}) ({learn} OR syllabus OR curriculum) ({site_univ})")
 
-    # unique & non-empty
-    uniq = []
-    seen = set()
-    for q in parts:
+    # 5) Bootcamps / vocational
+    variants.append(f"({syn_str}) ({learn}) ({site_boot})")
+
+    # 6) Syllabus PDFs (very academic)
+    variants.append(f"({syn_str}) (syllabus OR curriculum) filetype:pdf")
+
+    # 7) Add geo/mode/duration/price hints to one compact variant
+    extras = []
+    if hints["loc"]: extras.append(hints["loc"])
+    if hints["mode"]: extras.append(hints["mode"])
+    if hints["duration"]: extras.append(hints["duration"])
+    if hints["budget"]: extras.append(f"under {hints['budget']}")
+    if extras:
+        variants.append(f"({syn_str}) ({learn}) {' '.join(extras)}")
+
+    # unique & compact
+    uniq, seen = [], set()
+    for q in variants:
         q = clean(q)
         if q and q not in seen:
-            seen.add(q)
-            uniq.append(q)
-    return uniq[:6]  # cap to keep it fast
+            seen.add(q); uniq.append(q)
+    return uniq[:8]
 
-# -------------------- ranking --------------------
-
+# -------------------- Reranking --------------------
 def rerank(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
     texts = [f"{r.get('title','')} {r.get('snippet','')}" for r in results]
-    if not texts: 
-        return []
+    if not texts: return []
     vec = TfidfVectorizer(ngram_range=(1,2), stop_words="english", min_df=1)
     X = vec.fit_transform(texts + [user_query])
     sims = cosine_similarity(X[:-1], X[-1]).ravel()
@@ -248,30 +249,25 @@ def rerank(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
     return ranked
 
 # -------------------- UI --------------------
-
 st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="wide")
 st.markdown(
     "<style>.card{padding:12px 16px;border:1px solid #eee;border-radius:12px;margin-bottom:12px}"
     ".t{font-weight:600;font-size:1.05rem}.u{color:#6b7280;font-size:.9rem}</style>",
-    unsafe_allow_html=True
-)
+    unsafe_allow_html=True)
 st.markdown("<h1>Coursemon</h1>", unsafe_allow_html=True)
-st.caption("One-box GENAI-style search (no APIs). Type your need; I’ll expand it and search multiple engines.")
+st.caption("One-box search. I rewrite your query to target course/training pages across the web — no APIs.")
 
-query = st.text_input("Search the web", value="evening data science bootcamp in Karachi under $300", label_visibility="collapsed")
-
+q = st.text_input("Search", value="History and philosophy", label_visibility="collapsed")
 st.markdown("---")
 
-if query.strip():
+if q.strip():
     s = sess()
-    expanded = genai_expand(query)
+    expanded = genai_expand(q)
 
-    # show what I'm actually searching (for transparency)
     with st.expander("🔎 How I rewrote your query"):
         for i, qv in enumerate(expanded, 1):
             st.code(f"{i}. {qv}")
 
-    # collect results from multiple engines for each variant
     raw: List[Dict] = []
     for qv in expanded:
         raw += search_bing(qv, num=10, s=s)
@@ -279,10 +275,10 @@ if query.strip():
         raw += search_yahoo(qv, num=10, s=s)
 
     merged = dedupe(raw)
-    ranked = rerank(merged, query)
+    ranked = rerank(merged, q)
 
     if not ranked:
-        st.warning("No results parsed. Try simplifying the text (e.g., 'python bootcamp Karachi').")
+        st.warning("No results parsed. Try a simpler phrasing (e.g., 'philosophy course syllabus').")
     else:
         st.write(f"**{len(ranked)} results**")
         for r, score in ranked[:50]:
@@ -292,6 +288,5 @@ if query.strip():
                 f'<div class="u">{html.escape(r.get("url",""))}</div>'
                 f'<div style="margin-top:6px;">{html.escape(r.get("snippet",""))}</div>'
                 f'<div class="u" style="margin-top:6px;">score: {score:.2f} • {r.get("engine","")}</div>'
-                f'</div>',
-                unsafe_allow_html=True
+                f'</div>', unsafe_allow_html=True
             )
