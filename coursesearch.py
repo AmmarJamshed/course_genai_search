@@ -1,11 +1,8 @@
 # app.py
-# Coursemon — GENAI Search (No API, One-Box)
-# -------------------------------------------
-# One search bar. Results list. No API keys.
-# Engines: Bing, DuckDuckGo, Yahoo (public HTML scrape).
-# Smart query rewrite focuses on courses/trainings anywhere on the web.
+# Coursemon — GENAI Search (Groq + Google + Location)
+# ---------------------------------------------------
 
-import re, html
+import re, html, json
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -16,11 +13,11 @@ from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-APP_NAME = "Coursemon — GENAI Search (No API)"
+APP_NAME = "Coursemon — GENAI Search (Groq + Google + Location)"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-# -------------------- HTTP session --------------------
+# ==================== HTTP session ====================
 def sess() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
@@ -34,11 +31,38 @@ def dedupe(results: List[Dict]) -> List[Dict]:
     seen, out = set(), []
     for r in results:
         u = (r.get("url") or "").split("#")[0]
-        if not u or u in seen: continue
-        seen.add(u); out.append(r)
+        if not u or u in seen: 
+            continue
+        seen.add(u)
+        out.append(r)
     return out
 
-# -------------------- Engines (HTML scrape) --------------------
+# ==================== Search engines ====================
+def search_google(q: str, num: int, s: requests.Session) -> List[Dict]:
+    """Scrape Google Search results (unofficial)."""
+    try:
+        url = "https://www.google.com/search?" + urlencode({"q": q, "num": min(num, 20)})
+        r = s.get(url, timeout=10)
+        if not r.ok:
+            return []
+        soup = BeautifulSoup(r.text, "lxml")
+        out = []
+        for g in soup.select("div.g"):
+            a = g.select_one("a")
+            if not a or not a.get("href") or not a.get_text():
+                continue
+            title = clean(a.get_text())
+            link = a["href"]
+            sn = g.select_one("div.VwiC3b, span.aCOpRe, div.s3v9rd")
+            snippet = clean(sn.get_text()) if sn else ""
+            out.append({"title": title, "snippet": snippet, "url": link, "engine": "google"})
+            if len(out) >= num:
+                break
+        return out
+    except Exception as e:
+        print("Google scraping failed:", e)
+        return []
+
 def search_bing(q: str, num: int, s: requests.Session) -> List[Dict]:
     try:
         url = "https://www.bing.com/search?" + urlencode({"q": q, "count": min(num, 20)})
@@ -73,12 +97,6 @@ def search_ddg(q: str, num: int, s: requests.Session) -> List[Dict]:
             snippet = clean(sn.get_text() if sn else "")
             out.append({"title": title, "snippet": snippet, "url": a["href"], "engine": "ddg"})
             if len(out) >= num: break
-        if not out:
-            for a in soup.select("a.result__a, a.result__url"):
-                href = a.get("href")
-                if href and href.startswith("http"):
-                    out.append({"title": clean(a.get_text()), "snippet": "", "url": href, "engine": "ddg"})
-                    if len(out) >= num: break
         return out
     except Exception:
         return []
@@ -103,143 +121,20 @@ def search_yahoo(q: str, num: int, s: requests.Session) -> List[Dict]:
     except Exception:
         return []
 
-# -------------------- GENAI-style rewrite (rule-based) --------------------
-
-# Learning signals we want in searches
-LEARNING = [
-    "course","training","bootcamp","certificate","diploma","short course",
-    "MOOC","program","class","workshop","seminar","lecture",
-    "curriculum","syllabus","catalog"
-]
-
-# Subject synonyms — broad coverage incl. humanities
-SUBJECT_SYNONYMS = {
-    "history": ["history","world history","ancient history","modern history","historical studies"],
-    "philosophy": ["philosophy","ethics","logic","metaphysics","epistemology","philosophy of mind","aesthetics"],
-    "humanities": ["humanities","liberal arts","classics","religious studies","anthropology","sociology","political philosophy"],
-    "data science": ["data science","machine learning","ml","ai","data analytics","python data","statistics"],
-    "python": ["python","pandas","numpy","data wrangling","programming in python"],
-    "cybersecurity": ["cybersecurity","information security","infosec","soc","siem","network security"],
-    "business": ["business","management","entrepreneurship","marketing","finance","accounting","operations"],
-    "mba": ["mba","business administration","executive mba"],
-    "math": ["mathematics","calculus","linear algebra","discrete math","probability","statistics"],
-    "cs": ["computer science","algorithms","data structures","systems","software engineering"],
-    "design": ["design","graphic design","ui ux","user experience","product design","visual design"],
-    "english": ["english","literature","writing","composition","critical reading"],
-    "economics": ["economics","microeconomics","macroeconomics","econometrics"],
-    "law": ["law","legal studies","jurisprudence","international law","constitutional law"],
-}
-
-# Site packs
-MOOC_PACK = [
-    "site:coursera.org","site:edx.org","site:futurelearn.com","site:classcentral.com",
-    "site:udacity.com","site:udemy.com","site:datacamp.com","site:skillshare.com",
-    "site:linkedin.com/learning"
-]
-UNIV_PACK = [
-    "site:.edu","site:.ac.uk","site:.edu.pk","site:.ac.pk","site:.ac.in","site:.edu.au",
-    "site:openlearning.com","site:ocw.mit.edu","site:extension.harvard.edu","site:canvascatalog.com",
-    "catalog","bulletin"
-]
-BOOTCAMP_PACK = [
-    "site:generalassemb.ly","site:brainstation.io","site:lewagon.com","site:simplilearn.com",
-    "site:thinkful.com","site:springboard.com"
-]
-
-LOCATIONS = ["karachi","lahore","islamabad","pakistan","uk","london","usa","new york","germany","berlin","uae","dubai","india","mumbai","canada","toronto","europe","asia"]
-
-def parse_hints(text: str) -> Dict:
-    t = text.lower()
-    hints = {"topic": None, "loc": None, "budget": None, "mode": None, "duration": None}
-    # location
-    for loc in LOCATIONS:
-        if re.search(rf"\b{re.escape(loc)}\b", t):
-            hints["loc"] = loc; break
-    # price
-    m = re.search(r"(?:under|below|less than|<=)?\s*(?:rs\.?|pkr|\$|usd|eur|£)?\s*(\d{2,6})", t)
-    if m: hints["budget"] = m.group(1)
-    # mode
-    if re.search(r"\bonline|remote|live online\b", t): hints["mode"] = "online"
-    elif re.search(r"\b(on-?site|in[- ]person|campus)\b", t): hints["mode"] = "onsite"
-    # duration
-    d = re.search(r"\b(\d+\s*(hours?|days?|weeks?|months?))\b|evening|weekend|short|part[- ]time|full[- ]time", t)
-    if d: hints["duration"] = d.group(0)
-    # topic guess: strip common hint words
-    topic = t
-    topic = re.sub(r"(under|below|less than|<=|\d{2,6}|online|on-?site|in[- ]person|evening|weekend|short|part[- ]time|full[- ]time)", " ", topic)
-    for loc in LOCATIONS: topic = re.sub(rf"\b{re.escape(loc)}\b", " ", topic)
-    topic = clean(topic)
-    hints["topic"] = topic if topic else text.lower()
-    return hints
-
-def subject_expand(topic: str) -> List[str]:
-    topic = topic.strip()
-    out = [topic]
-    for k, vs in SUBJECT_SYNONYMS.items():
-        if k in topic:
-            out.extend(vs)
-    # If two words joined by "and", split and expand each (e.g., "history and philosophy")
-    if " and " in topic:
-        for part in [p.strip() for p in topic.split(" and ") if p.strip()]:
-            out.append(part)
-            for k, vs in SUBJECT_SYNONYMS.items():
-                if k in part:
-                    out.extend(vs)
-    return list(dict.fromkeys(out))
-
+# ==================== Rule-based GENAI rewrite (fallback) ====================
 def genai_expand(user_query: str) -> List[str]:
-    """Turn any topic prompt into robust course/training search queries."""
-    hints = parse_hints(user_query)
-    syns = subject_expand(hints["topic"])
-    syn_str = " OR ".join(f"\"{s}\"" for s in syns[:6])  # cap to keep short
-    learn = " OR ".join(LEARNING)
+    base = user_query.strip()
+    variants = [
+        f"{base} course",
+        f"{base} training",
+        f"{base} program",
+        f"{base} workshop",
+        f"{base} syllabus",
+    ]
+    return list(dict.fromkeys(variants))[:8]
 
-    site_mooc = " OR ".join(MOOC_PACK)
-    site_univ = " OR ".join(UNIV_PACK)
-    site_boot = " OR ".join(BOOTCAMP_PACK)
-
-    # structural operators for course pages
-    structural = "(intitle:course OR inurl:course OR inurl:courses OR inurl:program OR inurl:catalog OR inurl:syllabus)"
-
-    variants = []
-
-    # 1) Baseline: topic + learning signals
-    variants.append(f"({syn_str}) ({learn})")
-
-    # 2) Structural signals (forces course-like pages)
-    variants.append(f"({syn_str}) {structural}")
-
-    # 3) MOOC/marketplaces
-    variants.append(f"({syn_str}) ({learn}) ({site_mooc})")
-
-    # 4) University catalogs / official syllabi
-    variants.append(f"({syn_str}) ({learn} OR syllabus OR curriculum) ({site_univ})")
-
-    # 5) Bootcamps / vocational
-    variants.append(f"({syn_str}) ({learn}) ({site_boot})")
-
-    # 6) Syllabus PDFs (very academic)
-    variants.append(f"({syn_str}) (syllabus OR curriculum) filetype:pdf")
-
-    # 7) Add geo/mode/duration/price hints to one compact variant
-    extras = []
-    if hints["loc"]: extras.append(hints["loc"])
-    if hints["mode"]: extras.append(hints["mode"])
-    if hints["duration"]: extras.append(hints["duration"])
-    if hints["budget"]: extras.append(f"under {hints['budget']}")
-    if extras:
-        variants.append(f"({syn_str}) ({learn}) {' '.join(extras)}")
-
-    # unique & compact
-    uniq, seen = [], set()
-    for q in variants:
-        q = clean(q)
-        if q and q not in seen:
-            seen.add(q); uniq.append(q)
-    return uniq[:8]
-
-# -------------------- Reranking --------------------
-def rerank(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
+# ==================== Reranking (TF-IDF baseline) ====================
+def rerank_tfidf(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
     texts = [f"{r.get('title','')} {r.get('snippet','')}" for r in results]
     if not texts: return []
     vec = TfidfVectorizer(ngram_range=(1,2), stop_words="english", min_df=1)
@@ -248,39 +143,126 @@ def rerank(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
     ranked = sorted(zip(results, sims.tolist()), key=lambda x: x[1], reverse=True)
     return ranked
 
-# -------------------- UI --------------------
+# ==================== Groq Rewrite ====================
+def groq_rewrite(user_query: str) -> Optional[List[str]]:
+    api_key = st.secrets.get("GROQ_API_KEY")
+    if not api_key: return None
+    try:
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [
+                {"role": "system",
+                 "content": ("Rewrite the query into max 8 variations targeting real course/training pages. "
+                             "Return ONLY a JSON list of strings.")},
+                {"role": "user", "content": user_query}
+            ],
+            "temperature": 0.3, "max_tokens": 400
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=30
+        )
+        if resp.status_code != 200: return None
+        txt = resp.json()["choices"][0]["message"]["content"]
+        queries = json.loads(txt)
+        if isinstance(queries, list): return queries[:8]
+        return None
+    except Exception as e:
+        print("Groq rewrite failed:", e)
+        return None
+
+# ==================== Groq Rerank ====================
+def groq_rerank(results: List[Dict], user_query: str) -> Optional[List[Tuple[Dict, float]]]:
+    api_key = st.secrets.get("GROQ_API_KEY")
+    if not api_key: return None
+    try:
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [
+                {"role": "system",
+                 "content": ("You are a reranking engine for course/training search. "
+                             "Return ONLY a JSON list of {index, score} objects.")},
+                {"role": "user",
+                 "content": json.dumps({
+                     "query": user_query,
+                     "results": [
+                         {"index": i, "title": r.get("title"), "snippet": r.get("snippet"), "url": r.get("url")}
+                         for i, r in enumerate(results)
+                     ]
+                 })}
+            ],
+            "temperature": 0, "max_tokens": 800
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=30
+        )
+        if resp.status_code != 200: return None
+        txt = resp.json()["choices"][0]["message"]["content"]
+        order = json.loads(txt)
+        ranked = []
+        for o in order:
+            idx, score = o["index"], float(o.get("score", 1.0))
+            if 0 <= idx < len(results):
+                ranked.append((results[idx], score))
+        return ranked
+    except Exception as e:
+        print("Groq rerank failed:", e)
+        return None
+
+# ==================== UI ====================
 st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="wide")
 st.markdown(
     "<style>.card{padding:12px 16px;border:1px solid #eee;border-radius:12px;margin-bottom:12px}"
     ".t{font-weight:600;font-size:1.05rem}.u{color:#6b7280;font-size:.9rem}</style>",
     unsafe_allow_html=True)
 st.markdown("<h1>Coursemon</h1>", unsafe_allow_html=True)
-st.caption("One-box search. I rewrite your query to target course/training pages across the web — no APIs.")
+st.caption("One-box search. Google + Groq enhanced rewriting & reranking. Now with location filter.")
 
 q = st.text_input("Search", value="History and philosophy", label_visibility="collapsed")
+location = st.text_input("Location (city or country)", value="", placeholder="e.g., Karachi, Pakistan, London, USA")
 st.markdown("---")
 
 if q.strip():
     s = sess()
-    expanded = genai_expand(q)
 
-    with st.expander("🔎 How I rewrote your query"):
+    # If location entered, append to query
+    q_with_loc = f"{q} {location}".strip() if location else q
+
+    # Rewrite step
+    expanded = groq_rewrite(q_with_loc)
+    rewrite_engine = "groq"
+    if not expanded:
+        expanded = genai_expand(q_with_loc)
+        rewrite_engine = "rules"
+
+    with st.expander(f"🔎 How I rewrote your query (via {rewrite_engine})"):
         for i, qv in enumerate(expanded, 1):
             st.code(f"{i}. {qv}")
 
+    # Collect results
     raw: List[Dict] = []
     for qv in expanded:
+        raw += search_google(qv, num=10, s=s)
         raw += search_bing(qv, num=10, s=s)
         raw += search_ddg(qv, num=10, s=s)
         raw += search_yahoo(qv, num=10, s=s)
 
     merged = dedupe(raw)
-    ranked = rerank(merged, q)
+
+    # Rerank step
+    ranked = groq_rerank(merged, q_with_loc)
+    rerank_engine = "groq"
+    if not ranked:
+        ranked = rerank_tfidf(merged, q_with_loc)
+        rerank_engine = "tfidf"
 
     if not ranked:
-        st.warning("No results parsed. Try a simpler phrasing (e.g., 'philosophy course syllabus').")
+        st.warning("No results parsed. Try a simpler phrasing.")
     else:
-        st.write(f"**{len(ranked)} results**")
+        st.write(f"**{len(ranked)} results** (rewrite via {rewrite_engine}, rerank via {rerank_engine})")
         for r, score in ranked[:50]:
             st.markdown(
                 f'<div class="card">'
