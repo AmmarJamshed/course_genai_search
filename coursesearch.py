@@ -1,6 +1,6 @@
 # app.py
-# Coursemon — GENAI Search (Groq + Google + Location + Async + Filters + Cache)
-# -------------------------------------------------------------------
+# Coursemon — GENAI Search (Groq + Google + Location + Async + Filters + Cache + Fixed Google Scraper)
+# ---------------------------------------------------------------------------------------------------
 
 import re, html, json, asyncio
 from typing import List, Dict, Optional, Tuple
@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-APP_NAME = "Coursemon — GENAI Search (Groq + Google + Location + Async + Filters + Cache)"
+APP_NAME = "Coursemon — GENAI Search"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
@@ -46,20 +46,43 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> str:
         return ""
 
 
+# ✅ Fixed Google Scraper
 async def search_google_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
     url = "https://www.google.com/search?" + urlencode({"q": q, "num": min(num, 20)})
     html_text = await fetch(session, url)
-    if not html_text: return []
+    if not html_text:
+        return []
+    
     soup = BeautifulSoup(html_text, "lxml")
     out = []
-    for g in soup.select("div.g"):
+
+    # Results usually appear in div.tF2Cxc or div.g
+    for g in soup.select("div.tF2Cxc, div.g"):
         a = g.select_one("a")
-        if not a or not a.get("href") or not a.get_text(): continue
-        title = clean(a.get_text()); link = a["href"]
-        sn = g.select_one("div.VwiC3b, span.aCOpRe, div.s3v9rd")
+        if not a or not a.get("href"): 
+            continue
+
+        title = clean(a.get_text())
+        link = a["href"]
+
+        # Snippet candidates
+        sn = g.select_one("div.VwiC3b, span.aCOpRe, div.s3v9rd, div.IsZvec")
         snippet = clean(sn.get_text()) if sn else ""
-        out.append({"title": title, "snippet": snippet, "url": link, "engine": "google"})
-        if len(out) >= num: break
+
+        # Skip Google internal redirect links
+        if link.startswith("/"):
+            continue
+
+        out.append({
+            "title": title,
+            "snippet": snippet,
+            "url": link,
+            "engine": "google"
+        })
+
+        if len(out) >= num:
+            break
+    
     return out
 
 
@@ -114,9 +137,8 @@ async def search_yahoo_async(q: str, num: int, session: aiohttp.ClientSession) -
     return out
 
 
-@st.cache_data(show_spinner="Fetching results...", ttl=3600)  # cache for 1 hour
+@st.cache_data(show_spinner="Fetching results...", ttl=3600)  # cache 1 hour
 def cached_results(expanded: List[str]) -> List[Dict]:
-    """Wrapper to run async gather inside cache"""
     return asyncio.run(gather_results(expanded))
 
 
@@ -237,7 +259,7 @@ st.markdown(
     ".t{font-weight:600;font-size:1.05rem}.u{color:#6b7280;font-size:.9rem}</style>",
     unsafe_allow_html=True)
 st.markdown("<h1>Coursemon</h1>", unsafe_allow_html=True)
-st.caption("One-box search. Google + Groq enhanced rewriting & reranking. Async + filters + cached.")
+st.caption("One-box search. Google + Bing + DDG + Yahoo, with Groq rewriting & reranking. Async + filters + cached.")
 
 q = st.text_input("Search", value="History and philosophy", label_visibility="collapsed")
 
