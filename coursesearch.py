@@ -1,5 +1,10 @@
-# app.py — Fixed SerpAPI async integration
-# -----------------------------------------
+# app.py — Coursemon Global Course Search (No APIs required)
+# ----------------------------------------------------------
+# Aggregates public course & training listings from:
+# Coursera, Udemy, EdX, DataCamp, Simplilearn, Educative.io
+# + SerpAPI + async web scraping
+# + Semantic (zero-shot) filtering and TF-IDF reranking
+# ----------------------------------------------------------
 
 import re, html, json, asyncio
 from typing import List, Dict, Optional, Tuple
@@ -10,15 +15,16 @@ import aiohttp
 from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from transformers import pipeline
 
-APP_NAME = "Coursemon — GENAI Search"
+APP_NAME = "Coursemon — Global AI Course Search 🌎"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 # ==================== Helpers ====================
 def clean(x: Optional[str]) -> str:
     if not x: return ""
-    return re.sub(r"\s+", " ", html.unescape(x)).strip()
+    return re.sub(r"\s+", " ", html.unescape(str(x))).strip()
 
 def dedupe(results: List[Dict]) -> List[Dict]:
     seen, out = set(), []
@@ -30,32 +36,116 @@ def dedupe(results: List[Dict]) -> List[Dict]:
         out.append(r)
     return out
 
-# ==================== Async Fetch ====================
-async def fetch(session: aiohttp.ClientSession, url: str) -> str:
+async def fetch_html(session: aiohttp.ClientSession, url: str) -> str:
     try:
-        async with session.get(url, timeout=10) as resp:
+        async with session.get(url, headers={"User-Agent": UA}, timeout=15) as resp:
             if resp.status != 200:
                 return ""
             return await resp.text()
     except Exception:
         return ""
 
-# ✅ Async SerpAPI integration (no threads, pure async)
-async def search_serpapi_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
+# ==================== Scrapers ====================
+
+async def search_coursera(q: str, session: aiohttp.ClientSession) -> List[Dict]:
+    url = f"https://www.coursera.org/search?query={q.replace(' ', '%20')}"
+    html_text = await fetch_html(session, url)
+    if not html_text: return []
+    soup = BeautifulSoup(html_text, "lxml")
+    results = []
+    for item in soup.select("li[data-testid='search-result']"):
+        title = clean(item.select_one("h2"))
+        desc = clean(item.select_one("p"))
+        link_tag = item.select_one("a[href]")
+        link = f"https://www.coursera.org{link_tag['href']}" if link_tag else ""
+        if title and link:
+            results.append({
+                "title": title,
+                "snippet": desc,
+                "url": link,
+                "engine": "coursera"
+            })
+    return results
+
+async def search_udemy(q: str, session: aiohttp.ClientSession) -> List[Dict]:
+    url = f"https://www.udemy.com/courses/search/?q={q.replace(' ', '%20')}"
+    html_text = await fetch_html(session, url)
+    if not html_text: return []
+    soup = BeautifulSoup(html_text, "lxml")
+    results = []
+    for card in soup.select("div.popper--popper--2r2To.course-card--main-content--3xEIw"):
+        a = card.select_one("a.udlite-custom-focus-visible")
+        if not a: continue
+        title = clean(a.get_text())
+        link = "https://www.udemy.com" + a.get("href", "")
+        desc = clean(card.select_one("p.udlite-text-sm") or "")
+        results.append({"title": title, "snippet": desc, "url": link, "engine": "udemy"})
+    return results
+
+async def search_edx(q: str, session: aiohttp.ClientSession) -> List[Dict]:
+    url = f"https://www.edx.org/search?q={q.replace(' ', '+')}"
+    html_text = await fetch_html(session, url)
+    if not html_text: return []
+    soup = BeautifulSoup(html_text, "lxml")
+    results = []
+    for card in soup.select("div.discovery-card"):
+        title = clean(card.select_one("h3"))
+        desc = clean(card.select_one("div.discovery-card__content__description"))
+        a = card.select_one("a.discovery-card-link")
+        link = a["href"] if a and a.get("href", "").startswith("http") else f"https://www.edx.org{a['href']}" if a else ""
+        if title and link:
+            results.append({"title": title, "snippet": desc, "url": link, "engine": "edx"})
+    return results
+
+async def search_simplilearn(q: str, session: aiohttp.ClientSession) -> List[Dict]:
+    url = f"https://www.simplilearn.com/search?q={q.replace(' ', '+')}"
+    html_text = await fetch_html(session, url)
+    if not html_text: return []
+    soup = BeautifulSoup(html_text, "lxml")
+    results = []
+    for card in soup.select("div.search-result-card"):
+        title = clean(card.select_one("h3"))
+        desc = clean(card.select_one("p"))
+        a = card.select_one("a[href]")
+        link = f"https://www.simplilearn.com{a['href']}" if a else ""
+        results.append({"title": title, "snippet": desc, "url": link, "engine": "simplilearn"})
+    return results
+
+async def search_datacamp(q: str, session: aiohttp.ClientSession) -> List[Dict]:
+    url = f"https://www.datacamp.com/search?q={q.replace(' ', '+')}"
+    html_text = await fetch_html(session, url)
+    if not html_text: return []
+    soup = BeautifulSoup(html_text, "lxml")
+    results = []
+    for card in soup.select("a.course-block"):
+        title = clean(card.select_one("h4") or card.get_text())
+        link = "https://www.datacamp.com" + card.get("href", "")
+        results.append({"title": title, "snippet": "", "url": link, "engine": "datacamp"})
+    return results
+
+async def search_educative(q: str, session: aiohttp.ClientSession) -> List[Dict]:
+    url = f"https://www.educative.io/search?query={q.replace(' ', '%20')}"
+    html_text = await fetch_html(session, url)
+    if not html_text: return []
+    soup = BeautifulSoup(html_text, "lxml")
+    results = []
+    for card in soup.select("a.course-card"):
+        title = clean(card.get_text())
+        link = "https://www.educative.io" + card.get("href", "")
+        results.append({"title": title, "snippet": "", "url": link, "engine": "educative"})
+    return results
+
+# ==================== SerpAPI fallback ====================
+async def search_serpapi(q: str, session: aiohttp.ClientSession) -> List[Dict]:
     api_key = st.secrets.get("SERP_API_KEY")
     if not api_key:
         return []
+    params = {"engine": "google", "q": q, "num": 10, "api_key": api_key}
     try:
-        params = {
-            "engine": "google",
-            "q": q,
-            "num": num,
-            "api_key": api_key
-        }
-        async with session.get("https://serpapi.com/search", params=params, timeout=10) as resp:
-            if resp.status != 200:
+        async with session.get("https://serpapi.com/search", params=params, timeout=10) as r:
+            if r.status != 200:
                 return []
-            data = await resp.json()
+            data = await r.json()
             out = []
             for item in data.get("organic_results", []):
                 out.append({
@@ -68,91 +158,24 @@ async def search_serpapi_async(q: str, num: int, session: aiohttp.ClientSession)
     except Exception:
         return []
 
-# ✅ Google (HTML backup)
-async def search_google_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
-    url = "https://www.google.com/search?" + urlencode({"q": q, "num": min(num, 20)})
-    html_text = await fetch(session, url)
-    if not html_text: return []
-    soup = BeautifulSoup(html_text, "lxml")
-    out = []
-    for g in soup.select("div.tF2Cxc, div.g"):
-        a = g.select_one("a")
-        if not a or not a.get("href"): 
-            continue
-        title = clean(a.get_text())
-        link = a["href"]
-        sn = g.select_one("div.VwiC3b, span.aCOpRe, div.s3v9rd, div.IsZvec")
-        snippet = clean(sn.get_text()) if sn else ""
-        if link.startswith("/"): 
-            continue
-        out.append({"title": title, "snippet": snippet, "url": link, "engine": "google"})
-        if len(out) >= num: break
-    return out
+# ==================== Async Aggregator ====================
+@st.cache_data(show_spinner="Gathering global courses...", ttl=3600)
+def cached_results(queries: List[str]) -> List[Dict]:
+    return asyncio.run(gather_all(queries))
 
-async def search_bing_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
-    url = "https://www.bing.com/search?" + urlencode({"q": q, "count": min(num, 20)})
-    html_text = await fetch(session, url)
-    if not html_text: return []
-    soup = BeautifulSoup(html_text, "lxml")
-    out = []
-    for li in soup.select("li.b_algo"):
-        a = li.select_one("h2 a")
-        if not a or not a.get("href"): continue
-        title = clean(a.get_text()); link = a["href"]
-        sn = li.select_one("p, div.b_caption p")
-        snippet = clean(sn.get_text() if sn else "")
-        out.append({"title": title, "snippet": snippet, "url": link, "engine": "bing"})
-        if len(out) >= num: break
-    return out
-
-async def search_ddg_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
-    html_text = await fetch(session, "https://html.duckduckgo.com/html/?" + urlencode({"q": q}))
-    if not html_text: return []
-    soup = BeautifulSoup(html_text, "lxml")
-    out = []
-    for res in soup.select(".result"):
-        a = res.select_one("a.result__a, a.result__url")
-        if not a or not a.get("href") or not a["href"].startswith("http"): continue
-        title = clean(a.get_text())
-        sn = res.select_one(".result__snippet")
-        snippet = clean(sn.get_text() if sn else "")
-        out.append({"title": title, "snippet": snippet, "url": a["href"], "engine": "ddg"})
-        if len(out) >= num: break
-    return out
-
-async def search_yahoo_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
-    url = "https://search.yahoo.com/search?" + urlencode({"p": q})
-    html_text = await fetch(session, url)
-    if not html_text: return []
-    soup = BeautifulSoup(html_text, "lxml")
-    out = []
-    for d in soup.select("div#web h3.title a, div.dd.algo.algo-sr h3 a"):
-        href = d.get("href")
-        if not href or not href.startswith("http"): continue
-        title = clean(d.get_text())
-        cont = d.find_parent("div", class_=re.compile("algo"))
-        sn = cont.select_one("div.compText, p") if cont else None
-        snippet = clean(sn.get_text() if sn else "")
-        out.append({"title": title, "snippet": snippet, "url": href, "engine": "yahoo"})
-        if len(out) >= num: break
-    return out
-
-# ==================== Async Orchestrator ====================
-@st.cache_data(show_spinner="Fetching results...", ttl=3600)
-def cached_results(expanded: List[str]) -> List[Dict]:
-    return asyncio.run(gather_results(expanded))
-
-async def gather_results(expanded: List[str]) -> List[Dict]:
+async def gather_all(queries: List[str]) -> List[Dict]:
     results = []
-    async with aiohttp.ClientSession(headers={"User-Agent": UA}) as session:
+    async with aiohttp.ClientSession() as session:
         tasks = []
-        for qv in expanded:
+        for qv in queries:
             tasks += [
-                search_serpapi_async(qv, 10, session),
-                search_google_async(qv, 10, session),
-                search_bing_async(qv, 10, session),
-                search_ddg_async(qv, 10, session),
-                search_yahoo_async(qv, 10, session),
+                search_coursera(qv, session),
+                search_udemy(qv, session),
+                search_edx(qv, session),
+                search_simplilearn(qv, session),
+                search_datacamp(qv, session),
+                search_educative(qv, session),
+                search_serpapi(qv, session)
             ]
         all_results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in all_results:
@@ -160,11 +183,34 @@ async def gather_results(expanded: List[str]) -> List[Dict]:
                 results.extend(res)
     return results
 
-# ==================== Expand / Rerank ====================
-def genai_expand(user_query: str) -> List[str]:
-    base = user_query.strip()
-    variants = [f"{base} course", f"{base} training", f"{base} program", f"{base} workshop", f"{base} syllabus"]
-    return list(dict.fromkeys(variants))[:5]
+# ==================== Intelligent Filters ====================
+@st.cache_resource
+def load_classifier():
+    return pipeline("zero-shot-classification", model="MoritzLaurer/deberta-v3-base-mnli-fever-anli")
+
+def keyword_filter(results: List[Dict]) -> List[Dict]:
+    include_terms = ["course", "training", "program", "class", "bootcamp", "certificate", "learning"]
+    exclude_terms = ["news", "blog", "job", "vacancy", "forum"]
+    out = []
+    for r in results:
+        text = f"{r.get('title','')} {r.get('snippet','')} {r.get('url','')}".lower()
+        if not any(t in text for t in include_terms): continue
+        if any(t in text for t in exclude_terms): continue
+        out.append(r)
+    return out
+
+def semantic_filter(results: List[Dict], clf) -> List[Dict]:
+    labels = ["course", "training program", "bootcamp", "certificate program"]
+    final = []
+    for r in results:
+        text = f"{r.get('title','')} - {r.get('snippet','')}"
+        try:
+            pred = clf(text, candidate_labels=labels)
+            if max(pred["scores"]) >= 0.6:
+                final.append(r)
+        except Exception:
+            continue
+    return final
 
 def rerank_tfidf(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
     texts = [f"{r.get('title','')} {r.get('snippet','')}" for r in results]
@@ -175,43 +221,45 @@ def rerank_tfidf(results: List[Dict], user_query: str) -> List[Tuple[Dict, float
     ranked = sorted(zip(results, sims.tolist()), key=lambda x: x[1], reverse=True)
     return ranked
 
-# ==================== UI ====================
-st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="wide")
-st.markdown(
-    "<style>.card{padding:12px 16px;border:1px solid #eee;border-radius:12px;margin-bottom:12px}"
-    ".t{font-weight:600;font-size:1.05rem}.u{color:#6b7280;font-size:.9rem}</style>",
-    unsafe_allow_html=True)
-st.markdown("<h1>Coursemon</h1>", unsafe_allow_html=True)
-st.caption("One-box search with SerpAPI + Google + Bing + DDG + Yahoo, Async + filters + cache.")
+def expand_query(q: str) -> List[str]:
+    base = q.strip()
+    variants = [
+        f"{base} course", f"{base} training", f"{base} certification",
+        f"{base} bootcamp", f"{base} workshop", f"{base} class"
+    ]
+    return list(dict.fromkeys(variants))
 
-q = st.text_input("Search", value="History and philosophy", label_visibility="collapsed")
-course_type = st.selectbox("Filter by course type", ["All", "Online Course", "Onsite Training", "Online Live Training"])
-location = st.text_input("Location (city or country)", value="", placeholder="e.g., Karachi, Pakistan, London, USA")
+# ==================== UI ====================
+st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide")
+st.title("🌍 Coursemon Global AI Course & Training Search")
+st.caption("Find global courses and trainings from Coursera, Udemy, EdX, Simplilearn, DataCamp, Educative, and the web — powered by async scraping & AI.")
+
+query = st.text_input("Search for any topic", value="Data Science", label_visibility="collapsed")
 st.markdown("---")
 
-if q.strip():
-    q_with_loc = f"{q} {location}".strip() if location else q
-    if course_type != "All":
-        q_with_loc = f"{q_with_loc} {course_type}"
-    expanded = genai_expand(q_with_loc)
-    with st.expander("🔎 Query variants"):
+if query.strip():
+    expanded = expand_query(query)
+    with st.expander("🔍 Expanded Queries"):
         for i, qv in enumerate(expanded, 1):
             st.code(f"{i}. {qv}")
 
     raw = cached_results(expanded)
     merged = dedupe(raw)
-    ranked = rerank_tfidf(merged, q_with_loc)
+    merged = keyword_filter(merged)
 
+    st.info("🧠 Applying semantic filter...")
+    clf = load_classifier()
+    merged = semantic_filter(merged, clf)
+
+    ranked = rerank_tfidf(merged, query)
     if not ranked:
-        st.warning("No results found.")
+        st.warning("No relevant courses or trainings found.")
     else:
-        st.write(f"**{len(ranked)} results** (includes SerpAPI-enhanced Google results)")
-        for r, score in ranked[:50]:
+        st.success(f"✅ Found {len(ranked)} relevant results.")
+        for r, score in ranked[:60]:
             st.markdown(
-                f'<div class="card">'
-                f'<div class="t"><a href="{r["url"]}" target="_blank">{html.escape(r["title"] or r["url"])}</a></div>'
-                f'<div class="u">{html.escape(r.get("url",""))}</div>'
-                f'<div style="margin-top:6px;">{html.escape(r.get("snippet",""))}</div>'
-                f'<div class="u" style="margin-top:6px;">score: {score:.2f} • {r.get("engine","")}</div>'
-                f'</div>', unsafe_allow_html=True
+                f'<div style="border:1px solid #ddd;padding:12px;border-radius:10px;margin-bottom:8px">'
+                f'<b><a href="{r["url"]}" target="_blank">{html.escape(r["title"] or r["url"])}</a></b><br>'
+                f'<small>{r.get("engine","")} • Score: {score:.2f}</small><br>'
+                f'{html.escape(r.get("snippet",""))}</div>', unsafe_allow_html=True
             )
