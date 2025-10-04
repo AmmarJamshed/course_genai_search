@@ -1,13 +1,11 @@
-# app.py
-# Coursemon — GENAI Search (Groq + Google + SerpAPI + Location + Async + Filters + Cache)
-# -------------------------------------------------------------------------------------
+# app.py — Fixed SerpAPI async integration
+# -----------------------------------------
 
 import re, html, json, asyncio
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 import streamlit as st
-import requests
 import aiohttp
 from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -32,7 +30,7 @@ def dedupe(results: List[Dict]) -> List[Dict]:
         out.append(r)
     return out
 
-# ==================== Async Scraping ====================
+# ==================== Async Fetch ====================
 async def fetch(session: aiohttp.ClientSession, url: str) -> str:
     try:
         async with session.get(url, timeout=10) as resp:
@@ -42,8 +40,8 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> str:
     except Exception:
         return ""
 
-# ✅ SerpAPI Integration
-async def search_serpapi_async(q: str, num: int) -> List[Dict]:
+# ✅ Async SerpAPI integration (no threads, pure async)
+async def search_serpapi_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
     api_key = st.secrets.get("SERP_API_KEY")
     if not api_key:
         return []
@@ -54,28 +52,27 @@ async def search_serpapi_async(q: str, num: int) -> List[Dict]:
             "num": num,
             "api_key": api_key
         }
-        resp = requests.get("https://serpapi.com/search", params=params, timeout=10)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        out = []
-        for item in data.get("organic_results", []):
-            out.append({
-                "title": clean(item.get("title")),
-                "snippet": clean(item.get("snippet")),
-                "url": item.get("link"),
-                "engine": "serpapi"
-            })
-        return out
+        async with session.get("https://serpapi.com/search", params=params, timeout=10) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            out = []
+            for item in data.get("organic_results", []):
+                out.append({
+                    "title": clean(item.get("title")),
+                    "snippet": clean(item.get("snippet")),
+                    "url": item.get("link"),
+                    "engine": "serpapi"
+                })
+            return out
     except Exception:
         return []
 
-# ✅ Fixed Google Scraper (backup)
+# ✅ Google (HTML backup)
 async def search_google_async(q: str, num: int, session: aiohttp.ClientSession) -> List[Dict]:
     url = "https://www.google.com/search?" + urlencode({"q": q, "num": min(num, 20)})
     html_text = await fetch(session, url)
-    if not html_text:
-        return []
+    if not html_text: return []
     soup = BeautifulSoup(html_text, "lxml")
     out = []
     for g in soup.select("div.tF2Cxc, div.g"):
@@ -140,7 +137,7 @@ async def search_yahoo_async(q: str, num: int, session: aiohttp.ClientSession) -
         if len(out) >= num: break
     return out
 
-# Cache + Async gather
+# ==================== Async Orchestrator ====================
 @st.cache_data(show_spinner="Fetching results...", ttl=3600)
 def cached_results(expanded: List[str]) -> List[Dict]:
     return asyncio.run(gather_results(expanded))
@@ -151,24 +148,24 @@ async def gather_results(expanded: List[str]) -> List[Dict]:
         tasks = []
         for qv in expanded:
             tasks += [
-                asyncio.to_thread(search_serpapi_async, qv, 10),
+                search_serpapi_async(qv, 10, session),
                 search_google_async(qv, 10, session),
                 search_bing_async(qv, 10, session),
                 search_ddg_async(qv, 10, session),
                 search_yahoo_async(qv, 10, session),
             ]
-        all_results = await asyncio.gather(*tasks)
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in all_results:
-            results.extend(res)
+            if isinstance(res, list):
+                results.extend(res)
     return results
 
-# GENAI Rewrite
+# ==================== Expand / Rerank ====================
 def genai_expand(user_query: str) -> List[str]:
     base = user_query.strip()
     variants = [f"{base} course", f"{base} training", f"{base} program", f"{base} workshop", f"{base} syllabus"]
     return list(dict.fromkeys(variants))[:5]
 
-# TF-IDF Rerank
 def rerank_tfidf(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
     texts = [f"{r.get('title','')} {r.get('snippet','')}" for r in results]
     if not texts: return []
@@ -185,15 +182,10 @@ st.markdown(
     ".t{font-weight:600;font-size:1.05rem}.u{color:#6b7280;font-size:.9rem}</style>",
     unsafe_allow_html=True)
 st.markdown("<h1>Coursemon</h1>", unsafe_allow_html=True)
-st.caption("One-box search with Groq + SerpAPI + Google + Bing + DDG + Yahoo, Async + filters + cache.")
+st.caption("One-box search with SerpAPI + Google + Bing + DDG + Yahoo, Async + filters + cache.")
 
 q = st.text_input("Search", value="History and philosophy", label_visibility="collapsed")
-
-course_type = st.selectbox(
-    "Filter by course type",
-    ["All", "Online Course", "Onsite Training", "Online Live Training"]
-)
-
+course_type = st.selectbox("Filter by course type", ["All", "Online Course", "Onsite Training", "Online Live Training"])
 location = st.text_input("Location (city or country)", value="", placeholder="e.g., Karachi, Pakistan, London, USA")
 st.markdown("---")
 
@@ -201,7 +193,6 @@ if q.strip():
     q_with_loc = f"{q} {location}".strip() if location else q
     if course_type != "All":
         q_with_loc = f"{q_with_loc} {course_type}"
-
     expanded = genai_expand(q_with_loc)
     with st.expander("🔎 Query variants"):
         for i, qv in enumerate(expanded, 1):
@@ -214,7 +205,7 @@ if q.strip():
     if not ranked:
         st.warning("No results found.")
     else:
-        st.write(f"**{len(ranked)} results** including SerpAPI-enhanced results")
+        st.write(f"**{len(ranked)} results** (includes SerpAPI-enhanced Google results)")
         for r, score in ranked[:50]:
             st.markdown(
                 f'<div class="card">'
