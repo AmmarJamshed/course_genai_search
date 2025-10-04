@@ -1,12 +1,13 @@
-# app.py — Coursemon Global Course Search (No APIs required)
-# ----------------------------------------------------------
-# Aggregates public course & training listings from:
-# Coursera, Udemy, EdX, DataCamp, Simplilearn, Educative.io
-# + SerpAPI + async web scraping
-# + Semantic (zero-shot) filtering and TF-IDF reranking
-# ----------------------------------------------------------
+# app.py — Coursemon Global Course & Training Search (Light Edition)
+# -----------------------------------------------------------------
+# ✅ Works entirely without machine learning
+# ✅ Async scraping from Coursera, Udemy, EdX, Simplilearn, DataCamp, Educative
+# ✅ Optional SerpAPI results (if key in secrets)
+# ✅ Keyword-based filtering + TF-IDF reranking
+# ✅ 100% Streamlit Cloud compatible
+# -----------------------------------------------------------------
 
-import re, html, json, asyncio
+import re, html, asyncio
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -15,15 +16,15 @@ import aiohttp
 from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import pipeline
 
-APP_NAME = "Coursemon — Global AI Course Search 🌎"
+APP_NAME = "Coursemon — Global Course & Training Search 🌍"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 # ==================== Helpers ====================
 def clean(x: Optional[str]) -> str:
-    if not x: return ""
+    if not x:
+        return ""
     return re.sub(r"\s+", " ", html.unescape(str(x))).strip()
 
 def dedupe(results: List[Dict]) -> List[Dict]:
@@ -59,12 +60,7 @@ async def search_coursera(q: str, session: aiohttp.ClientSession) -> List[Dict]:
         link_tag = item.select_one("a[href]")
         link = f"https://www.coursera.org{link_tag['href']}" if link_tag else ""
         if title and link:
-            results.append({
-                "title": title,
-                "snippet": desc,
-                "url": link,
-                "engine": "coursera"
-            })
+            results.append({"title": title, "snippet": desc, "url": link, "engine": "coursera"})
     return results
 
 async def search_udemy(q: str, session: aiohttp.ClientSession) -> List[Dict]:
@@ -73,13 +69,10 @@ async def search_udemy(q: str, session: aiohttp.ClientSession) -> List[Dict]:
     if not html_text: return []
     soup = BeautifulSoup(html_text, "lxml")
     results = []
-    for card in soup.select("div.popper--popper--2r2To.course-card--main-content--3xEIw"):
-        a = card.select_one("a.udlite-custom-focus-visible")
-        if not a: continue
+    for a in soup.select("a.udlite-custom-focus-visible"):
         title = clean(a.get_text())
         link = "https://www.udemy.com" + a.get("href", "")
-        desc = clean(card.select_one("p.udlite-text-sm") or "")
-        results.append({"title": title, "snippet": desc, "url": link, "engine": "udemy"})
+        results.append({"title": title, "snippet": "", "url": link, "engine": "udemy"})
     return results
 
 async def search_edx(q: str, session: aiohttp.ClientSession) -> List[Dict]:
@@ -108,7 +101,8 @@ async def search_simplilearn(q: str, session: aiohttp.ClientSession) -> List[Dic
         desc = clean(card.select_one("p"))
         a = card.select_one("a[href]")
         link = f"https://www.simplilearn.com{a['href']}" if a else ""
-        results.append({"title": title, "snippet": desc, "url": link, "engine": "simplilearn"})
+        if title and link:
+            results.append({"title": title, "snippet": desc, "url": link, "engine": "simplilearn"})
     return results
 
 async def search_datacamp(q: str, session: aiohttp.ClientSession) -> List[Dict]:
@@ -135,7 +129,6 @@ async def search_educative(q: str, session: aiohttp.ClientSession) -> List[Dict]
         results.append({"title": title, "snippet": "", "url": link, "engine": "educative"})
     return results
 
-# ==================== SerpAPI fallback ====================
 async def search_serpapi(q: str, session: aiohttp.ClientSession) -> List[Dict]:
     api_key = st.secrets.get("SERP_API_KEY")
     if not api_key:
@@ -146,20 +139,18 @@ async def search_serpapi(q: str, session: aiohttp.ClientSession) -> List[Dict]:
             if r.status != 200:
                 return []
             data = await r.json()
-            out = []
-            for item in data.get("organic_results", []):
-                out.append({
-                    "title": clean(item.get("title")),
-                    "snippet": clean(item.get("snippet")),
-                    "url": item.get("link"),
-                    "engine": "serpapi"
-                })
-            return out
+            return [
+                {"title": clean(item.get("title")),
+                 "snippet": clean(item.get("snippet")),
+                 "url": item.get("link"),
+                 "engine": "serpapi"}
+                for item in data.get("organic_results", [])
+            ]
     except Exception:
         return []
 
 # ==================== Async Aggregator ====================
-@st.cache_data(show_spinner="Gathering global courses...", ttl=3600)
+@st.cache_data(show_spinner="Fetching global courses...", ttl=1800)
 def cached_results(queries: List[str]) -> List[Dict]:
     return asyncio.run(gather_all(queries))
 
@@ -183,14 +174,10 @@ async def gather_all(queries: List[str]) -> List[Dict]:
                 results.extend(res)
     return results
 
-# ==================== Intelligent Filters ====================
-@st.cache_resource
-def load_classifier():
-    return pipeline("zero-shot-classification", model="MoritzLaurer/deberta-v3-base-mnli-fever-anli")
-
+# ==================== Filtering & Ranking ====================
 def keyword_filter(results: List[Dict]) -> List[Dict]:
     include_terms = ["course", "training", "program", "class", "bootcamp", "certificate", "learning"]
-    exclude_terms = ["news", "blog", "job", "vacancy", "forum"]
+    exclude_terms = ["news", "blog", "job", "vacancy", "forum", "review"]
     out = []
     for r in results:
         text = f"{r.get('title','')} {r.get('snippet','')} {r.get('url','')}".lower()
@@ -199,23 +186,10 @@ def keyword_filter(results: List[Dict]) -> List[Dict]:
         out.append(r)
     return out
 
-def semantic_filter(results: List[Dict], clf) -> List[Dict]:
-    labels = ["course", "training program", "bootcamp", "certificate program"]
-    final = []
-    for r in results:
-        text = f"{r.get('title','')} - {r.get('snippet','')}"
-        try:
-            pred = clf(text, candidate_labels=labels)
-            if max(pred["scores"]) >= 0.6:
-                final.append(r)
-        except Exception:
-            continue
-    return final
-
 def rerank_tfidf(results: List[Dict], user_query: str) -> List[Tuple[Dict, float]]:
     texts = [f"{r.get('title','')} {r.get('snippet','')}" for r in results]
     if not texts: return []
-    vec = TfidfVectorizer(ngram_range=(1,2), stop_words="english", min_df=1)
+    vec = TfidfVectorizer(stop_words="english", ngram_range=(1,2))
     X = vec.fit_transform(texts + [user_query])
     sims = cosine_similarity(X[:-1], X[-1]).ravel()
     ranked = sorted(zip(results, sims.tolist()), key=lambda x: x[1], reverse=True)
@@ -231,8 +205,8 @@ def expand_query(q: str) -> List[str]:
 
 # ==================== UI ====================
 st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide")
-st.title("🌍 Coursemon Global AI Course & Training Search")
-st.caption("Find global courses and trainings from Coursera, Udemy, EdX, Simplilearn, DataCamp, Educative, and the web — powered by async scraping & AI.")
+st.title("🌍 Coursemon Global Course & Training Search")
+st.caption("Find global courses and trainings from Coursera, Udemy, EdX, Simplilearn, DataCamp, Educative, and Google — async, fast, and API-free.")
 
 query = st.text_input("Search for any topic", value="Data Science", label_visibility="collapsed")
 st.markdown("---")
@@ -245,13 +219,9 @@ if query.strip():
 
     raw = cached_results(expanded)
     merged = dedupe(raw)
-    merged = keyword_filter(merged)
+    filtered = keyword_filter(merged)
+    ranked = rerank_tfidf(filtered, query)
 
-    st.info("🧠 Applying semantic filter...")
-    clf = load_classifier()
-    merged = semantic_filter(merged, clf)
-
-    ranked = rerank_tfidf(merged, query)
     if not ranked:
         st.warning("No relevant courses or trainings found.")
     else:
