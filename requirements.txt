@@ -6,11 +6,11 @@ requests
 scikit-learn
 numpy
 pandas
-transformers
 torch
+transformers
 sentencepiece
 accelerate
-nest_asyncio
 html5lib
-python-dotenv
+nest_asyncio
 rich
+python-dotenv
